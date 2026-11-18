@@ -1,15 +1,18 @@
 # Created by Kishore
 """
-Kishore Signals - Crypto 1-Hour Daily Open Price Action
+Kishore Signals - Crypto 1-Hour Price Action
 Scanner + Backtest (Binance Vision Spot USDT).  LONG only, 1H, all times UTC.
 
-Rules
-  1. 00:00 UTC 1H candle = strong BEARISH candle
-  2. 01:00 UTC 1H candle = strong BULLISH candle
-  3. Buy limit at 50% of the 01:00 candle High-Low range
-  4. SL slightly below the 01:00 candle low
-  5. TP4 = High of the 00:00 candle, TP1-TP3 = 25/50/75% of the distance entry -> TP4
-  6. 25% of the position closed at each TP, whatever is left is closed at end of the UTC day
+Rules (no session rule - the setup is valid at ANY hour)
+  1. A = strong BEARISH 1H candle, immediately followed by B = strong BULLISH 1H candle
+  2. Buy limit at 50% of the B candle High-Low range
+  3. SL slightly below the B candle low
+  4. TP2 = High of the A candle, TP1 = 50% of the distance entry -> TP2.  50% of the position closed at each TP
+  5. The order is valid (and the trade is held) for max 24 candles after B, whatever is left is closed then
+  6. Trend / zone rule (checked at candle A):
+       - uptrend + A prints at a supply zone (near the recent swing high)  -> skip
+       - downtrend (B is a sudden counter-trend bullish candle)            -> skip
+       - exception: still taken if B closes above the open of A (B fully recovers A)
   7. Fixed position size per trade (default Rs 1,00,000)
 """
 from __future__ import annotations
@@ -59,8 +62,16 @@ class Params:
     body_ratio: float = 0.60      # min body / range
     min_body_atr: float = 0.50    # min body in ATR multiples
     atr_len: int = 14
-    sl_buffer: float = 0.10       # % below the 01:00 low
-    tp_fracs: tuple = (0.25, 0.50, 0.75, 1.0)
+    sl_buffer: float = 0.10       # % below the B candle low
+    tp_fracs: tuple = (0.50, 1.0)   # TP1, TP2 as a fraction of the distance entry -> high of A
+    tp_close: tuple = (0.50, 0.50)  # share of the position closed at TP1, TP2
+    max_bars: int = 24            # candles the order waits / the trade is held after B
+    use_filter: bool = True       # trend / supply-zone rule on or off
+    trend_fast: int = 50          # EMA length (fast)
+    trend_slow: int = 200         # EMA length (slow)
+    zone_lookback: int = 48       # candles used to find the recent swing high (supply zone)
+    zone_atr: float = 0.5         # supply zone = swing high minus this many ATR
+    allow_engulf: bool = True     # take a "risky" setup anyway if B closes above the open of A
     sl_first: bool = True         # same candle touches SL and TP -> assume SL first
     be_after_tp1: bool = False    # move SL to entry after TP1
     fee: float = 0.10             # % per side
@@ -276,47 +287,83 @@ def candle_strength(df: pd.DataFrame, p: Params):
     atr = calc_atr(df, p.atr_len).to_numpy(float)
     body, rng = np.abs(c - o), h - l
     ratio = np.divide(body, rng, out=np.zeros(len(df)), where=rng > 0)
-    strong = (ratio >= p.body_ratio) & (body >= p.min_body_atr * atr)
+    with np.errstate(invalid="ignore"):
+        strong = (ratio >= p.body_ratio) & (body >= p.min_body_atr * atr)
     return (c < o) & strong, (c > o) & strong
+
+
+def market_context(df: pd.DataFrame, p: Params):
+    """Per candle: trend (+1 up / -1 down / 0 range) and 'at supply zone' flag.
+    Uptrend   = EMA fast > EMA slow and close > EMA slow.   Downtrend = the opposite.
+    Supply    = the candle high reaches the zone just below the previous swing high
+                (highest high of the last `zone_lookback` candles, this candle excluded)."""
+    c = df["close"]
+    cl = c.to_numpy(float)
+    ef = c.ewm(span=p.trend_fast, adjust=False, min_periods=p.trend_fast).mean().to_numpy(float)
+    es = c.ewm(span=p.trend_slow, adjust=False, min_periods=p.trend_slow).mean().to_numpy(float)
+    atr = calc_atr(df, p.atr_len).to_numpy(float)
+    swing = df["high"].rolling(p.zone_lookback, min_periods=p.zone_lookback).max().shift(1).to_numpy(float)
+    with np.errstate(invalid="ignore"):
+        up = (ef > es) & (cl > es)
+        down = (ef < es) & (cl < es)
+        at_supply = df["high"].to_numpy(float) >= swing - p.zone_atr * atr
+    trend = np.where(up, 1, np.where(down, -1, 0))
+    return trend, at_supply
 
 
 def make_levels(h0: float, h1: float, l1: float, p: Params):
     entry = (h1 + l1) / 2.0
     sl = l1 * (1 - p.sl_buffer / 100.0)
-    tp4 = h0
-    if not (tp4 > entry > sl):
+    tp_top = h0                                  # high of the bearish candle A = final target (TP2)
+    if not (tp_top > entry > sl):
         return None
-    d = tp4 - entry
-    tps = [entry + d * p.tp_fracs[0], entry + d * p.tp_fracs[1], entry + d * p.tp_fracs[2], tp4]
+    d = tp_top - entry
+    tps = [entry + d * f for f in p.tp_fracs]
     return entry, sl, tps
 
 
 def find_signals(df: pd.DataFrame, p: Params) -> list:
+    """Every strong-bearish -> strong-bullish pair at ANY hour. Each signal carries the market context
+    and `skip` = True when the trend / supply rule says not to take it."""
     n = len(df)
     if n < 30:
         return []
     bear, bull = candle_strength(df, p)
-    h, l = df["high"].to_numpy(float), df["low"].to_numpy(float)
-    idx, hours = df.index, df.index.hour.to_numpy()
+    o, h, l, c = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    idx = df.index
+    trend, at_supply = market_context(df, p)
+    contiguous = np.asarray((idx[1:] - idx[:-1]) == ONE_HOUR)
     out = []
-    for i in np.flatnonzero((hours == 0) & bear):
-        if i + 1 >= n or hours[i + 1] != 1 or idx[i + 1] - idx[i] != ONE_HOUR or not bull[i + 1]:
-            continue
+    for i in np.flatnonzero(bear[:-1] & bull[1:] & contiguous):
         lv = make_levels(h[i], h[i + 1], l[i + 1], p)
         if lv is None:
             continue
-        out.append({"i": int(i), "entry": lv[0], "sl": lv[1], "tps": lv[2]})
+        tr_i = int(trend[i])
+        if tr_i == 1 and at_supply[i]:
+            ctx, risky = "uptrend @ supply", True
+        elif tr_i == -1:
+            ctx, risky = "downtrend (counter-trend bull)", True
+        else:
+            ctx, risky = ("uptrend pullback" if tr_i == 1 else "range"), False
+        skip = False
+        if risky and p.use_filter:
+            if p.allow_engulf and c[i + 1] > o[i]:
+                ctx += " + engulf"
+            else:
+                skip = True
+        out.append({"i": int(i), "entry": lv[0], "sl": lv[1], "tps": lv[2], "ctx": ctx, "skip": skip})
     return out
 
 
 def simulate_trade(O, H, L, C, entry, sl, tps, p: Params, final: bool) -> dict:
-    """Walk candles AFTER the 01:00 candle (02:00 ... 23:00).
-    status: CANCELLED | EXPIRED | PENDING | OPEN | CLOSED"""
-    fracs = [0.25, 0.25, 0.25, 0.25]
+    """Walk the candles AFTER the B candle (at most max_bars of them).
+    status: CANCELLED | EXPIRED | PENDING | OPEN | CLOSED.  `end_k` = last candle index the trade/order used."""
+    fracs = list(p.tp_close)
     filled, fill_px, fill_k = False, None, None
-    remaining = [0, 1, 2, 3]
+    remaining = list(range(len(tps)))
     parts = []                      # (candle_k, fraction, price, label)
     cur_sl = sl
+    last = len(O) - 1
     for k in range(len(O)):
         o, h, l = O[k], H[k], L[k]
         if not filled:
@@ -325,8 +372,8 @@ def simulate_trade(O, H, L, C, entry, sl, tps, p: Params, final: bool) -> dict:
             elif l <= entry:
                 fill_px = entry
             else:
-                if h >= tps[3]:     # TP4 reached before the order filled -> setup cancelled
-                    return {"status": "CANCELLED"}
+                if h >= tps[-1]:    # final TP reached before the order filled -> setup cancelled
+                    return {"status": "CANCELLED", "end_k": k}
                 continue
             filled, fill_k = True, k
         sl_level = cur_sl
@@ -347,13 +394,13 @@ def simulate_trade(O, H, L, C, entry, sl, tps, p: Params, final: bool) -> dict:
         if not remaining:
             break
     if not filled:
-        return {"status": "EXPIRED" if final else "PENDING"}
+        return {"status": "EXPIRED" if final else "PENDING", "end_k": last}
     if remaining:
         if final:
-            parts.append((len(O) - 1, sum(fracs[i] for i in remaining), float(C[-1]), "EOD"))
+            parts.append((last, sum(fracs[i] for i in remaining), float(C[-1]), "TIME"))
         else:
-            return {"status": "OPEN", "fill_px": fill_px, "fill_k": fill_k, "parts": parts}
-    return {"status": "CLOSED", "fill_px": fill_px, "fill_k": fill_k, "parts": parts}
+            return {"status": "OPEN", "fill_px": fill_px, "fill_k": fill_k, "parts": parts, "end_k": last}
+    return {"status": "CLOSED", "fill_px": fill_px, "fill_k": fill_k, "parts": parts, "end_k": parts[-1][0]}
 
 
 def trade_return(fill_px: float, parts: list, p: Params) -> float:
@@ -365,23 +412,35 @@ def trade_return(fill_px: float, parts: list, p: Params) -> float:
 # ═════════════════════════════════════════════════════════════════════════════
 #  Backtest
 # ═════════════════════════════════════════════════════════════════════════════
+COUNT_KEYS = ("raw", "filtered", "overlap", "signals", "cancelled", "expired")
+
+
 def backtest_symbol(symbol: str, df: pd.DataFrame, p: Params, start: pd.Timestamp):
-    counts = {"signals": 0, "cancelled": 0, "expired": 0}
+    counts = {k: 0 for k in COUNT_KEYS}
     trades = []
     if df.empty:
         return trades, counts
-    n, idx, hours = len(df), df.index, df.index.hour.to_numpy()
+    n, idx = len(df), df.index
     O, H, L, C = (df[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    busy_until = -1                                    # candle index until which the previous trade/order is live
     for s in find_signals(df, p):
         i = s["i"]
         if idx[i] < start:
             continue
-        end = i + 23                                   # the 23:00 candle
-        if end >= n or hours[end] != 23 or idx[end] - idx[i] != pd.Timedelta(hours=23):
-            continue                                   # incomplete day -> skip
+        end = i + 2 + p.max_bars                       # exclusive end of the trade window
+        if end > n or idx[end - 1] - idx[i + 1] != pd.Timedelta(hours=p.max_bars):
+            continue                                   # incomplete window -> skip
+        counts["raw"] += 1
+        if s["skip"]:
+            counts["filtered"] += 1
+            continue
+        if i + 1 <= busy_until:                        # one trade at a time per coin
+            counts["overlap"] += 1
+            continue
         counts["signals"] += 1
-        sl_ = slice(i + 2, end + 1)
+        sl_ = slice(i + 2, end)
         res = simulate_trade(O[sl_], H[sl_], L[sl_], C[sl_], s["entry"], s["sl"], s["tps"], p, final=True)
+        busy_until = i + 2 + res["end_k"]
         if res["status"] == "CANCELLED":
             counts["cancelled"] += 1
             continue
@@ -397,10 +456,12 @@ def backtest_symbol(symbol: str, df: pd.DataFrame, p: Params, start: pd.Timestam
         trades.append({
             "symbol": symbol,
             "date": idx[i].date(),
+            "setup_time": idx[i + 1],
+            "ctx": s["ctx"],
             "fill_time": times[res["fill_k"]],
             "exit_time": times[parts[-1][0]],
             "entry": s["entry"], "fill": fill_px, "sl": s["sl"],
-            "tp1": s["tps"][0], "tp2": s["tps"][1], "tp3": s["tps"][2], "tp4": s["tps"][3],
+            "tp1": s["tps"][0], "tp2": s["tps"][1],
             "path": " → ".join(labels),
             "tps_hit": tps_hit,
             "ret_pct": ret * 100.0,
@@ -411,8 +472,8 @@ def backtest_symbol(symbol: str, df: pd.DataFrame, p: Params, start: pd.Timestam
 
 
 def run_backtest(symbols: list, start: pd.Timestamp, end: pd.Timestamp, p: Params, progress):
-    warm_start = start - pd.Timedelta(days=3)
-    all_trades, totals, failed = [], {"signals": 0, "cancelled": 0, "expired": 0}, []
+    warm_start = start - pd.Timedelta(days=12)         # warm-up for EMA200 / swing-high lookback
+    all_trades, totals, failed = [], {k: 0 for k in COUNT_KEYS}, []
     done = 0
     with ThreadPoolExecutor(max_workers=8) as ex:
         futs = {ex.submit(fetch_symbol, s, warm_start, end): s for s in symbols}
@@ -431,7 +492,7 @@ def run_backtest(symbols: list, start: pd.Timestamp, end: pd.Timestamp, p: Param
                     totals[k] += cnt[k]
             done += 1
             progress.progress(done / len(symbols), text=f"{done}/{len(symbols)}  {sym}")
-    cols = ["symbol", "date", "fill_time", "exit_time", "entry", "fill", "sl", "tp1", "tp2", "tp3", "tp4",
+    cols = ["symbol", "date", "setup_time", "ctx", "fill_time", "exit_time", "entry", "fill", "sl", "tp1", "tp2",
             "path", "tps_hit", "ret_pct", "pnl", "result"]
     tr = pd.DataFrame(all_trades, columns=cols)
     if not tr.empty:
@@ -456,9 +517,9 @@ def compute_stats(tr: pd.DataFrame) -> dict:
         "expectancy": tr["pnl"].mean(),
         "max_dd": dd, "avg_hold_h": hold,
         "best": tr["pnl"].max(), "worst": tr["pnl"].min(),
-        "tp_rates": [(tr["tps_hit"] >= k).mean() * 100.0 for k in (1, 2, 3, 4)],
+        "tp_rates": [(tr["tps_hit"] >= k).mean() * 100.0 for k in (1, 2)],
         "sl_rate": tr["path"].str.contains("SL").mean() * 100.0,
-        "eod_rate": tr["path"].str.contains("EOD").mean() * 100.0,
+        "time_rate": tr["path"].str.contains("TIME").mean() * 100.0,
     }
 
 
@@ -475,12 +536,23 @@ def per_symbol_table(tr: pd.DataFrame) -> pd.DataFrame:
     return out.sort_values("Total PnL", ascending=False).reset_index().rename(columns={"symbol": "Symbol"})
 
 
+def per_context_table(tr: pd.DataFrame) -> pd.DataFrame:
+    g = tr.groupby("ctx")
+    out = pd.DataFrame({
+        "Trades": g.size(),
+        "Wins": g["pnl"].apply(lambda s: int((s > 0).sum())),
+        "Total PnL": g["pnl"].sum().round(0),
+    })
+    out["Win rate %"] = (out["Wins"] / out["Trades"] * 100).round(1)
+    return out.sort_values("Total PnL", ascending=False).reset_index().rename(columns={"ctx": "Market context"})
+
+
 # ═════════════════════════════════════════════════════════════════════════════
 #  Scanner
 # ═════════════════════════════════════════════════════════════════════════════
 def scan_symbol(symbol: str, p: Params, now: pd.Timestamp) -> dict:
     row = {"Symbol": symbol, "rank": 9}
-    raw = rest_klines(symbol, limit=150)
+    raw = rest_klines(symbol, limit=500)
     if not raw:
         row["Status"] = "⚠️ No data"
         return row
@@ -490,45 +562,52 @@ def scan_symbol(symbol: str, p: Params, now: pd.Timestamp) -> dict:
         return row
     row["Last"] = float(df["close"].iloc[-1])
     closed = df[df.index + ONE_HOUR <= now]
-    today = now.normalize()
-    if today not in closed.index:
-        row["Status"] = "⏳ 00:00 candle forming" if now < today + ONE_HOUR else "⚠️ No data"
-        row["rank"] = 8
+    n = len(closed)
+    if n < 30:
+        row["Status"] = "⚠️ No data"
         return row
-    bear, bull = candle_strength(closed, p)
-    i = closed.index.get_loc(today)
-    if not bear[i]:
-        row["Status"], row["rank"] = "— No setup (00:00 not strong bearish)", 7
+    O, H, L, C = (closed[k].to_numpy(float) for k in ("open", "high", "low", "close"))
+    # only setups whose B candle is at most max_bars candles old (older ones are over by now)
+    recent = [s for s in find_signals(closed, p) if s["i"] + 1 >= n - 1 - p.max_bars]
+    best = None
+    for s in reversed(recent):                         # newest first
+        j = s["i"] + 1
+        if s["skip"]:
+            cand = ("SKIP", s, None)
+        else:
+            sl_ = slice(j + 1, j + 1 + p.max_bars)
+            res = simulate_trade(O[sl_], H[sl_], L[sl_], C[sl_], s["entry"], s["sl"], s["tps"], p,
+                                 final=len(O[sl_]) >= p.max_bars)
+            cand = (res["status"], s, res)
+        if cand[0] in ("PENDING", "OPEN"):
+            best = cand
+            break
+        if best is None:
+            best = cand
+    if best is None:
+        row["Status"], row["rank"] = "— No setup", 7
         return row
-    t1 = today + ONE_HOUR
-    if t1 not in closed.index:
-        row["Status"], row["rank"] = "👀 Bearish 00:00 found - waiting for 01:00 close", 2
-        return row
-    j = closed.index.get_loc(t1)
-    if not bull[j]:
-        row["Status"], row["rank"] = "— No setup (01:00 not strong bullish)", 7
-        return row
-    lv = make_levels(float(closed["high"].iloc[i]), float(closed["high"].iloc[j]), float(closed["low"].iloc[j]), p)
-    if lv is None:
-        row["Status"], row["rank"] = "— Skipped (TP4 <= entry)", 7
-        return row
-    entry, sl, tps = lv
-    rest = closed.iloc[j + 1:]
-    res = simulate_trade(rest["open"].to_numpy(float), rest["high"].to_numpy(float),
-                         rest["low"].to_numpy(float), rest["close"].to_numpy(float), entry, sl, tps, p, final=False)
-    st_ = res["status"]
-    if st_ == "PENDING":
+    st_, s, res = best
+    j = s["i"] + 1
+    row["Setup (UTC)"] = f"{closed.index[j]:%m-%d %H:%M}"
+    row["Context"] = s["ctx"]
+    if st_ == "SKIP":
+        row["Status"], row["rank"] = "🚫 Skipped by trend / supply rule", 5
+    elif st_ == "PENDING":
         row["Status"], row["rank"] = "🟡 SIGNAL - buy limit active", 0
     elif st_ == "OPEN":
         hit = sum(1 for x in res["parts"] if x[3].startswith("TP"))
         row["Status"], row["rank"] = f"🟢 In trade (TPs hit: {hit})", 1
     elif st_ == "CLOSED":
-        row["Status"], row["rank"] = "🏁 Closed today: " + " → ".join(x[3] for x in res["parts"]), 3
+        row["Status"], row["rank"] = "🏁 Closed: " + " → ".join(x[3] for x in res["parts"]), 3
+    elif st_ == "EXPIRED":
+        row["Status"], row["rank"] = f"⚪ Expired (not filled in {p.max_bars}h)", 4
     else:
-        row["Status"], row["rank"] = "⚪ Cancelled (TP4 reached before fill)", 4
-    risk, reward = (entry - sl) / entry * 100.0, (tps[3] - entry) / entry * 100.0
+        row["Status"], row["rank"] = "⚪ Cancelled (TP2 reached before fill)", 4
+    entry, sl, tps = s["entry"], s["sl"], s["tps"]
+    risk, reward = (entry - sl) / entry * 100.0, (tps[-1] - entry) / entry * 100.0
     row.update({
-        "Entry": entry, "SL": sl, "TP1": tps[0], "TP2": tps[1], "TP3": tps[2], "TP4": tps[3],
+        "Entry": entry, "SL": sl, "TP1": tps[0], "TP2": tps[1],
         "Risk %": round(risk, 2), "Reward %": round(reward, 2), "R:R": round(reward / risk, 2),
         "Dist to entry %": round((row["Last"] / entry - 1) * 100.0, 2),
     })
@@ -541,10 +620,10 @@ def run_scan(symbols: list, p: Params, now: pd.Timestamp) -> pd.DataFrame:
         for r in ex.map(lambda s: scan_symbol(s, p, now), symbols):
             rows.append(r)
     df = pd.DataFrame(rows).sort_values(["rank", "Symbol"]).drop(columns="rank")
-    for c in ("Last", "Entry", "SL", "TP1", "TP2", "TP3", "TP4"):
+    for c in ("Last", "Entry", "SL", "TP1", "TP2"):
         if c in df:
             df[c] = df[c].map(fmt)
-    cols = ["Symbol", "Status", "Last", "Entry", "SL", "TP1", "TP2", "TP3", "TP4",
+    cols = ["Symbol", "Status", "Setup (UTC)", "Context", "Last", "Entry", "SL", "TP1", "TP2",
             "Risk %", "Reward %", "R:R", "Dist to entry %"]
     return df[[c for c in cols if c in df.columns]].reset_index(drop=True)
 
@@ -569,11 +648,21 @@ def sidebar_params():
     body_ratio = sb.slider("Min body / range", 0.30, 0.95, 0.60, 0.05)
     min_body_atr = sb.slider("Min body (x ATR)", 0.0, 2.0, 0.50, 0.1)
     atr_len = sb.number_input("ATR length", 5, 50, 14)
-    sl_buffer = sb.number_input("SL buffer below 01:00 low (%)", 0.0, 2.0, 0.10, 0.05)
-    sb.caption("TP1 / TP2 / TP3 = % of the distance entry → TP4 (00:00 high)")
-    t1 = sb.number_input("TP1 fraction", 0.05, 0.95, 0.25, 0.05)
-    t2 = sb.number_input("TP2 fraction", 0.05, 0.95, 0.50, 0.05)
-    t3 = sb.number_input("TP3 fraction", 0.05, 0.95, 0.75, 0.05)
+    sl_buffer = sb.number_input("SL buffer below B candle low (%)", 0.0, 2.0, 0.10, 0.05)
+    sb.caption("TP1 / TP2 = % of the distance entry → high of the bearish candle (TP2 = full distance)")
+    t1 = sb.number_input("TP1 fraction", 0.05, 1.00, 0.50, 0.05)
+    t2 = sb.number_input("TP2 fraction", 0.05, 1.00, 1.00, 0.05)
+    c1 = sb.number_input("% of position closed at TP1", 10, 90, 50, 10)
+    max_bars = sb.number_input("Max candles to wait / hold after B", 4, 96, 24, 1)
+
+    sb.header("Trend / supply rule")
+    use_filter = sb.checkbox("Skip counter-trend 1H candles", True)
+    allow_engulf = sb.checkbox("…but take it if B closes above the open of A", True)
+    trend_fast = sb.number_input("Trend EMA fast", 10, 100, 50, 5)
+    trend_slow = sb.number_input("Trend EMA slow", 50, 400, 200, 10)
+    zone_lookback = sb.number_input("Supply zone: swing-high lookback (candles)", 12, 200, 48, 4)
+    zone_atr = sb.number_input("Supply zone width (x ATR below swing high)", 0.0, 3.0, 0.5, 0.1)
+
     sb.header("Backtest")
     capital = sb.number_input("Rs per trade (fixed)", 1000, 100000000, 100000, 10000)
     fee = sb.number_input("Fee % per side", 0.0, 1.0, 0.10, 0.01)
@@ -581,7 +670,10 @@ def sidebar_params():
     sl_first = sb.checkbox("Same candle hits SL & TP → SL first (conservative)", True)
     be = sb.checkbox("Move SL to entry after TP1", False)
     p = Params(body_ratio=body_ratio, min_body_atr=min_body_atr, atr_len=int(atr_len), sl_buffer=sl_buffer,
-               tp_fracs=(t1, t2, t3, 1.0), sl_first=sl_first, be_after_tp1=be, fee=fee, slippage=slip,
+               tp_fracs=tuple(sorted((float(t1), float(t2)))), tp_close=(c1 / 100.0, 1.0 - c1 / 100.0),
+               max_bars=int(max_bars), use_filter=use_filter, trend_fast=int(trend_fast),
+               trend_slow=int(trend_slow), zone_lookback=int(zone_lookback), zone_atr=float(zone_atr),
+               allow_engulf=allow_engulf, sl_first=sl_first, be_after_tp1=be, fee=fee, slippage=slip,
                capital=float(capital))
     return symbols, p
 
@@ -589,8 +681,8 @@ def sidebar_params():
 def tab_scanner(symbols, p):
     now = utc_now()
     ist = now + pd.Timedelta(hours=5, minutes=30)
-    st.caption(f"UTC now: {now:%Y-%m-%d %H:%M}  |  IST: {ist:%H:%M}  |  00:00 UTC candle = 05:30 IST, "
-               f"01:00 UTC candle closes at 06:30 IST")
+    st.caption(f"UTC now: {now:%Y-%m-%d %H:%M}  |  IST: {ist:%H:%M}  |  no session rule - every closed 1H candle "
+               f"is checked, setups up to {p.max_bars} candles old are shown")
     if st.button("🔍 Scan now", type="primary"):
         with st.spinner(f"Scanning {len(symbols)} symbols..."):
             st.session_state["scan"] = (utc_now(), run_scan(symbols, p, utc_now()))
@@ -600,7 +692,7 @@ def tab_scanner(symbols, p):
         c1, c2, c3 = st.columns(3)
         c1.metric("🟡 Active signals", int(df["Status"].str.startswith("🟡").sum()))
         c2.metric("🟢 In trade", int(df["Status"].str.startswith("🟢").sum()))
-        c3.metric("👀 Waiting for 01:00", int(df["Status"].str.startswith("👀").sum()))
+        c3.metric("🚫 Skipped by rule", int(df["Status"].str.startswith("🚫").sum()))
         st.dataframe(df, hide_index=True)
 
 
@@ -643,13 +735,15 @@ def tab_backtest(symbols, p):
     b[2].metric("Avg win", inr(s["avg_win"]))
     b[3].metric("Avg loss", inr(s["avg_loss"]))
     b[4].metric("Max drawdown", inr(s["max_dd"]))
-    d = st.columns(6)
-    for k in range(4):
+    d = st.columns(4)
+    for k in range(2):
         d[k].metric(f"TP{k + 1} reached", f"{s['tp_rates'][k]:.0f}%")
-    d[4].metric("Trades with SL", f"{s['sl_rate']:.0f}%")
-    d[5].metric("EOD exits", f"{s['eod_rate']:.0f}%")
-    st.caption(f"Signals: {totals['signals']}  |  filled: {s['trades']}  |  cancelled (TP4 before fill): "
-               f"{totals['cancelled']}  |  never filled: {totals['expired']}  |  best trade: {inr(s['best'])}  |  "
+    d[2].metric("Trades with SL", f"{s['sl_rate']:.0f}%")
+    d[3].metric("Time exits", f"{s['time_rate']:.0f}%")
+    st.caption(f"Setups found: {totals['raw']}  |  skipped by trend/supply rule: {totals['filtered']}  |  "
+               f"skipped (coin already in a trade): {totals['overlap']}  |  taken: {totals['signals']}  |  "
+               f"filled: {s['trades']}  |  cancelled (TP2 before fill): {totals['cancelled']}  |  "
+               f"never filled: {totals['expired']}  |  best trade: {inr(s['best'])}  |  "
                f"worst trade: {inr(s['worst'])}  |  avg holding: {s['avg_hold_h']:.1f}h")
 
     cum = tr["pnl"].cumsum()
@@ -668,13 +762,17 @@ def tab_backtest(symbols, p):
     fs.update_layout(title="PnL per symbol (Rs)", height=320, margin=dict(t=40, b=10))
     m2.plotly_chart(fs)
 
+    st.subheader("Per market context")
+    st.dataframe(per_context_table(tr), hide_index=True)
+
     st.subheader("Per symbol")
     st.dataframe(ps, hide_index=True)
 
     st.subheader("Trade log")
     log = tr.rename(columns={
-        "symbol": "Symbol", "date": "Day", "fill_time": "Filled", "exit_time": "Exited", "entry": "Entry",
-        "fill": "Fill price", "sl": "SL", "tp1": "TP1", "tp2": "TP2", "tp3": "TP3", "tp4": "TP4",
+        "symbol": "Symbol", "date": "Day", "setup_time": "Setup (B candle)", "ctx": "Context",
+        "fill_time": "Filled", "exit_time": "Exited", "entry": "Entry",
+        "fill": "Fill price", "sl": "SL", "tp1": "TP1", "tp2": "TP2",
         "path": "Exit path", "tps_hit": "TPs hit", "ret_pct": "Return %", "pnl": "PnL (Rs)", "result": "Result"})
     log["Return %"] = log["Return %"].round(2)
     log["PnL (Rs)"] = log["PnL (Rs)"].round(0)
@@ -685,17 +783,25 @@ def tab_backtest(symbols, p):
 
 def tab_rules():
     st.markdown("""
-**Kishore Signals – Crypto 1-Hour Daily Open Price Action (long only)**
+**Kishore Signals – Crypto 1-Hour Price Action (long only, no session rule)**
 
-1. 00:00 UTC 1H candle must be a **strong bearish** candle (body ≥ 60% of range and ≥ 0.5×ATR by default).
-2. 01:00 UTC 1H candle must be a **strong bullish** candle.
-3. **Entry:** buy limit at 50% of the 01:00 candle's High-Low. Valid until the end of that UTC day.
-4. **SL:** slightly below the 01:00 candle low.
-5. **TP4:** High of the 00:00 candle. TP1-TP3 are 25/50/75% of the distance entry → TP4. 25% of the position is closed at each TP.
-6. Unfilled order is cancelled if price reaches TP4 first. Anything still open is closed at the end of the UTC day (23:00 candle close).
-7. Every trade uses a **fixed Rs per trade** amount; PnL = amount × net return (fees + slippage included).
+1. **A** = a **strong bearish** 1H candle (body ≥ 60% of range and ≥ 0.5×ATR by default), at **any hour**.
+2. **B** = the very next 1H candle must be a **strong bullish** candle.
+3. **Entry:** buy limit at 50% of the B candle's High-Low. Valid for up to 24 candles after B.
+4. **SL:** slightly below the B candle low.
+5. **TP2:** High of the A candle. **TP1:** 50% of the distance entry → TP2. 50% of the position is closed at each TP.
+6. Unfilled order is cancelled if price reaches TP2 first. Anything still open after 24 candles is closed at that candle's close (time exit).
+7. **Trend / supply rule** (trend and zone are read at candle A):
+   - **Uptrend** (EMA50 > EMA200 and close > EMA200) and the bearish candle A prints at a **supply zone**
+     (its high reaches just below the recent swing high) → the setup is **skipped** - price may really go down from there.
+   - **Downtrend** (EMA50 < EMA200 and close < EMA200) → the bullish candle B is a sudden counter-trend move → **skipped**.
+   - **Exception:** such a setup is still taken when B **closes above the open of A** (B fully recovers A - the strategy
+     rules are respected). Switch this off in the sidebar for a strict skip.
+   - Uptrend pullbacks away from the swing high and range markets are always taken.
+8. One trade at a time per coin. Every trade uses a **fixed Rs per trade** amount; PnL = amount × net return (fees + slippage included).
 
-**Backtest assumptions:** the order can first fill on the 02:00 candle; if a candle touches both SL and a TP the SL is assumed first (switchable); simultaneous trades in different coins are all taken independently.
+**Backtest assumptions:** the order can first fill on the candle after B; if a candle touches both SL and a TP the SL is assumed first (switchable);
+trades in different coins are all taken independently. The *Per market context* table shows how each context performed.
 
 **Data:** Binance Vision monthly 1H spot klines (ms and µs timestamps handled), the current month from the Binance REST API.
 Spot candles differ slightly from perpetual futures candles, so results will not match TradingView exactly.
@@ -707,7 +813,7 @@ Spot candles differ slightly from perpetual futures candles, so results will not
 def main():
     st.set_page_config(page_title=APP_TITLE, page_icon="📈", layout="wide")
     st.title(f"📈 {APP_TITLE}")
-    st.caption("1H Daily Open Price Action - Binance Spot USDT scanner + backtest")
+    st.caption("1H Price Action - Binance Spot USDT scanner + backtest")
     symbols, p = sidebar_params()
     t1, t2, t3 = st.tabs(["🔍 Scanner", "📊 Backtest", "ℹ️ Rules"])
     with t1:
